@@ -13,10 +13,10 @@ page = st.sidebar.radio(
     ["Home", "Well Map Viewer", "📈 Groundwater Data", "📉 Groundwater Level Trends for Wells", "📊 Groundwater Prediction"]
 )
 
-file_path = Parez\Wells detailed data.csv"
-gw_file_path = Parez\GW data.csv"
-output_path = Parez\GW data (missing filled).csv"
-cleaned_outlier_path = Parez\GW data (missing filled).csv"
+file_path = Wells detailed data.csv"
+gw_file_path = GW data.csv"
+output_path = GW data (missing filled).csv"
+cleaned_outlier_path = GW data (missing filled).csv"
 
 # ──────────────── LOAD WELL DATA ────────────────
 if page not in ["📈 Groundwater Data", "📉 Groundwater Level Trends for Wells"]:

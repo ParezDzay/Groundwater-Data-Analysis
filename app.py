@@ -150,4 +150,3 @@ st.download_button(
     file_name=f"{well}_forecast_{datetime.today().date()}.csv",
     mime="text/csv"
 )
-

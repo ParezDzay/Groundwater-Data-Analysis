@@ -1,9 +1,14 @@
-# app.py — ANN-only groundwater forecaster (depth view)
-# -----------------------------------------------------
-# • Loads “GW data (missing filled).csv”
-# • User chooses well, lags, test split, hidden layers, horizon
-# • Trains an MLPRegressor, shows depth-inverted plots, downloads CSV
-# • Fixed: forecast step now drops extra “pred” column → no ValueError
+# app.py — Groundwater forecasting dashboard (ANN + ARIMA)
+# --------------------------------------------------------
+# • Reads “GW data (missing filled).csv” (Year, Months, W1…Wn)
+# • Sidebar lets you pick:
+#       – Well
+#       – Model type  (🔮 ANN  or  📈 ARIMA)
+# • For the chosen model it
+#       – Trains on the historic series (80 % train, 20 % test)
+#       – Produces a 5-year (60-month) forecast
+#       – Shows ❶ performance metrics ❷ depth-inverted plot (actual + fit + forecast)
+#       – Displays forecast table & download link
 
 import streamlit as st
 import pandas as pd
@@ -16,137 +21,145 @@ from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing   import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics         import r2_score, mean_squared_error
+from statsmodels.tsa.arima.model import ARIMA
 
-st.set_page_config(page_title="ANN Groundwater Prediction", layout="wide")
-st.title("🔮 ANN Groundwater Prediction (Depth View)")
+st.set_page_config(page_title="Groundwater Forecasting (ANN & ARIMA)", layout="wide")
+st.title("Groundwater Forecasting – ANN vs ARIMA (Depth View)")
 
 DATA_PATH = "GW data (missing filled).csv"
+FORE_HORIZON = 60     # months (5 years)
 
 # ───────── helpers ─────────
 @st.cache_data(show_spinner=False)
 def load_data(path):
-    if not Path(path).exists():
-        return None
+    if not Path(path).exists(): return None
     df = pd.read_csv(path)
-    df["Date"] = pd.to_datetime(df["Year"].astype(str) + "-" +
-                                df["Months"].astype(str) + "-01")
-    df["month_sin"] = np.sin(2 * np.pi * df["Months"] / 12)
-    df["month_cos"] = np.cos(2 * np.pi * df["Months"] / 12)
+    df["Date"] = pd.to_datetime(df["Year"].astype(str)+"-"+df["Months"].astype(str)+"-01")
+    df["month_sin"] = np.sin(2*np.pi*df["Months"]/12)
+    df["month_cos"] = np.cos(2*np.pi*df["Months"]/12)
     return df.sort_values("Date").reset_index(drop=True)
 
 def add_lags(df, well, n):
     out = df.copy()
-    for k in range(1, n + 1):
+    for k in range(1, n+1):
         out[f"{well}_lag{k}"] = out[well].shift(k)
     return out.dropna().reset_index(drop=True)
 
-def fit_ann(df_feat, well, test_size, layers):
-    X = df_feat.drop(columns=[well, "Date"])
-    y = df_feat[well]
-
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=test_size, shuffle=False
-    )
-
+# ─── ANN training & forecast ───
+def train_ann(df_feat, well, hidden_layers, lag_steps):
+    X = df_feat.drop(columns=[well,"Date"]); y = df_feat[well]
+    Xtr,Xte,ytr,yte = train_test_split(X,y,test_size=0.2,shuffle=False)
     scaler = StandardScaler()
-    X_tr_s = scaler.fit_transform(X_tr)
-    X_te_s = scaler.transform(X_te)
-
-    model = MLPRegressor(hidden_layer_sizes=layers,
-                         activation="relu",
-                         solver="adam",
-                         max_iter=2000,
-                         random_state=42,
-                         early_stopping=True)
-    model.fit(X_tr_s, y_tr)
-
-    df_feat.loc[X_tr.index, "pred"] = model.predict(X_tr_s)
-    df_feat.loc[X_te.index, "pred"] = model.predict(X_te_s)
-
+    Xtr_s, Xte_s = scaler.fit_transform(Xtr), scaler.transform(Xte)
+    mdl = MLPRegressor(hidden_layer_sizes=hidden_layers,
+                       activation="relu", solver="adam",
+                       max_iter=2000, random_state=42,
+                       early_stopping=True).fit(Xtr_s,ytr)
+    df_feat.loc[Xtr.index,"pred"] = mdl.predict(Xtr_s)
+    df_feat.loc[Xte.index,"pred"] = mdl.predict(Xte_s)
     metrics = {
-        "R² train":  round(r2_score(y_tr, df_feat.loc[X_tr.index, "pred"]), 4),
-        "RMSE train": round(np.sqrt(mean_squared_error(y_tr, df_feat.loc[X_tr.index, "pred"])), 4),
-        "R² test":   round(r2_score(y_te, df_feat.loc[X_te.index, "pred"]), 4),
-        "RMSE test":  round(np.sqrt(mean_squared_error(y_te, df_feat.loc[X_te.index, "pred"])), 4)
+        "R² train":round(r2_score(ytr,df_feat.loc[Xtr.index,"pred"]),4),
+        "RMSE train":round(np.sqrt(mean_squared_error(ytr,df_feat.loc[Xtr.index,"pred"])),4),
+        "R² test":round(r2_score(yte,df_feat.loc[Xte.index,"pred"])),4,
+        "RMSE test":round(np.sqrt(mean_squared_error(yte,df_feat.loc[Xte.index,"pred"])),4)
     }
-    return model, scaler, df_feat, metrics
-
-def recursive_forecast(model, scaler, last_row, well, lags, horizon):
-    """Iterative forecast—drops columns not seen by scaler (e.g., 'pred')."""
-    features = list(scaler.feature_names_in_)  # columns used during training
-    rows, r = [], last_row.copy()
-
-    for _ in range(horizon):
-        # shift lag columns
-        for k in range(lags, 1, -1):
+    # recursive forecast
+    feats = scaler.feature_names_in_
+    r = df_feat.tail(1).iloc[0].copy()
+    future=[]
+    for _ in range(FORE_HORIZON):
+        for k in range(lag_steps,1,-1):
             r[f"{well}_lag{k}"] = r[f"{well}_lag{k-1}"]
         r[f"{well}_lag1"] = r["pred"]
-
-        # advance date + cyclical encodings
         nxt = r["Date"] + pd.DateOffset(months=1)
-        r.update({
-            "Date": nxt,
-            "Months": nxt.month,
-            "month_sin": np.sin(2 * np.pi * nxt.month / 12),
-            "month_cos": np.cos(2 * np.pi * nxt.month / 12)
-        })
-
-        # prepare feature vector exactly in training order
-        X_next = r[features].to_frame().T.values
-        val = model.predict(X_next)[0]
-
+        r.update({"Date":nxt,"Months":nxt.month,
+                  "month_sin":np.sin(2*np.pi*nxt.month/12),
+                  "month_cos":np.cos(2*np.pi*nxt.month/12)})
+        val = mdl.predict(scaler.transform(r[feats].to_frame().T))[0]
         r[well] = r["pred"] = val
-        rows.append({"Date": nxt, "Depth": val})
+        future.append({"Date":nxt,"Depth":val})
+    return metrics, df_feat, pd.DataFrame(future)
 
-    return pd.DataFrame(rows)
+# ─── ARIMA training & forecast ───
+def train_arima(series, seasonal):
+    order = (1,1,1)        # simple defaults; tweak if needed
+    sorder = (1,1,1,12) if seasonal else (0,0,0,0)
+    model = ARIMA(series, order=order, seasonal_order=sorder).fit()
+    start = len(series)
+    end   = start + FORE_HORIZON - 1
+    pred = model.get_forecast(FORE_HORIZON)
+    future = pd.DataFrame({
+        "Date": pd.date_range(series.index[-1]+pd.DateOffset(months=1), periods=FORE_HORIZON, freq="MS"),
+        "Depth": pred.predicted_mean.values,
+        "lower": pred.conf_int(alpha=0.05)["lower Depth"].values,
+        "upper": pred.conf_int(alpha=0.05)["upper Depth"].values
+    })
+    metrics = {"AIC": round(model.aic,1), "BIC": round(model.bic,1)}
+    return metrics, pred, future
 
 # ───────── UI ─────────
 df = load_data(DATA_PATH)
 if df is None:
-    st.error(f"CSV '{DATA_PATH}' not found. Upload it to continue.")
-    uploaded = st.file_uploader("Upload groundwater CSV", type="csv")
-    if uploaded:
-        Path(DATA_PATH).write_bytes(uploaded.getvalue())
-        st.experimental_rerun()
+    st.error(f"CSV '{DATA_PATH}' not found. Upload to continue.")
+    if up:=st.file_uploader("Upload CSV",type="csv"):
+        Path(DATA_PATH).write_bytes(up.getvalue()); st.experimental_rerun()
     st.stop()
 
 wells = [c for c in df.columns if c.startswith("W")]
-well   = st.sidebar.selectbox("Well", wells)
-lags   = st.sidebar.slider("Lag steps", 1, 24, 12)
-test_f = st.sidebar.slider("Test size", 0.1, 0.5, 0.2, step=0.05)
-layers = tuple(int(x.strip()) for x in
-               st.sidebar.text_input("Hidden layers (comma-sep)", "64,32").split(",")
-               if x.strip())
-horiz  = st.sidebar.number_input("Forecast horizon (months)", 1, 60, 12)
+well  = st.sidebar.selectbox("Well", wells)
+model_type = st.sidebar.radio("Choose model", ["🔮 ANN","📈 ARIMA"])
 
-feat   = add_lags(df[["Date", "Months", "month_sin", "month_cos", well]], well, lags)
-model, scaler, df_pred, metrics = fit_ann(feat, well, test_f, layers)
+if model_type == "🔮 ANN":
+    lags  = st.sidebar.slider("Lag steps",1,24,12)
+    layers= tuple(int(x) for x in st.sidebar.text_input("Hidden layers","64,32").split(",") if x.strip())
 
-st.subheader("Model performance")
-st.json(metrics)
+    feat = add_lags(df[["Date","Months","month_sin","month_cos",well]], well, lags)
+    met, hist_df, future = train_ann(feat, well, layers, lags)
 
-fig_hist = px.line(df_pred, x="Date", y=[well, "pred"],
-                   labels={"value": "Water-table depth (m)",
-                           "variable": "Legend"},
-                   title=f"{well} — actual vs predicted")
-fig_hist.update_yaxes(autorange="reversed")
-st.plotly_chart(fig_hist, use_container_width=True)
+    st.subheader("ANN metrics"); st.json(met)
 
-future = recursive_forecast(model, scaler, df_pred.tail(1).iloc[0],
-                            well, lags, horiz)
+    df_actual = hist_df[["Date",well]].rename(columns={well:"Depth"}).assign(Type="Actual")
+    df_fit    = hist_df[["Date","pred"]].rename(columns={"pred":"Depth"}).assign(Type="Predicted")
+    df_fore   = future.assign(Type="Forecast")
+    plot_df   = pd.concat([df_actual,df_fit,df_fore])
 
-fig_fore = px.line(
-    pd.concat([df_pred[["Date", well]].rename(columns={well: "Depth"}),
-               future]),
-    x="Date", y="Depth",
-    title=f"{well} — {horiz}-month forecast"
-)
-fig_fore.update_yaxes(autorange="reversed")
-st.plotly_chart(fig_fore, use_container_width=True)
+    fig=px.line(plot_df,x="Date",y="Depth",color="Type",
+                labels={"Depth":"Water-table depth (m)"},
+                title=f"{well} — ANN fit & 5-y forecast")
+    fig.update_yaxes(autorange="reversed")
+    fig.update_traces(mode="lines")
+    for t in fig.data:
+        if t.name=="Forecast": t.update(line=dict(dash="dash"))
+    fig.add_vline(x=hist_df["Date"].max(), line_dash="dot", line_color="gray")
+    st.plotly_chart(fig,use_container_width=True)
 
-st.download_button(
-    "Download forecast CSV",
-    future.to_csv(index=False).encode(),
-    file_name=f"{well}_forecast_{datetime.today().date()}.csv",
-    mime="text/csv"
-)
+else:  # ARIMA
+    seasonal = st.sidebar.checkbox("Include 12-month seasonality", True)
+    series = pd.Series(df[well].values, index=df["Date"])
+    metrics, pred_obj, future = train_arima(series, seasonal)
+
+    st.subheader("ARIMA metrics"); st.json(metrics)
+
+    df_fit = pd.DataFrame({"Date":series.index,"Depth":pred_obj.fittedvalues,"Type":"Predicted"})
+    df_actual = pd.DataFrame({"Date":series.index,"Depth":series.values,"Type":"Actual"})
+    df_fore = future.assign(Type="Forecast")
+    plot_df = pd.concat([df_actual,df_fit,df_fore])
+
+    fig = px.line(plot_df,x="Date",y="Depth",color="Type",
+                  labels={"Depth":"Water-table depth (m)"},
+                  title=f"{well} — ARIMA fit & 5-y forecast")
+    fig.update_yaxes(autorange="reversed")
+    fig.update_traces(mode="lines")
+    for t in fig.data:
+        if t.name=="Forecast": t.update(line=dict(dash="dash"))
+    fig.add_vline(x=series.index[-1], line_dash="dot", line_color="gray")
+    st.plotly_chart(fig,use_container_width=True)
+
+# ---- table & download for both cases ----
+st.subheader("🗒️ 5-Year Forecast Table")
+st.dataframe(future[["Date","Depth"]].style.format({"Depth":"{:.2f}"}), use_container_width=True)
+
+st.download_button("Download forecast CSV",
+                   future[["Date","Depth"]].to_csv(index=False).encode(),
+                   file_name=f"{well}_{model_type.strip()}_forecast_{datetime.today().date()}.csv",
+                   mime="text/csv")

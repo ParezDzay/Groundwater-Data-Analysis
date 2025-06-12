@@ -10,7 +10,7 @@ from sklearn.metrics import r2_score, mean_squared_error
 from statsmodels.tsa.arima.model import ARIMA
 
 st.set_page_config(page_title="Groundwater Forecasts", layout="wide")
-st.title("Groundwater Forecasting — Depth View (clipped, savable)")
+st.title("Groundwater Forecasting — Depth View")
 
 DATA_PATH   = "GW data (missing filled).csv"
 FORE_MONTHS = 60   # 5-year horizon

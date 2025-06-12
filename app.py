@@ -1,162 +1,109 @@
-# app.py — Groundwater forecasts (ARIMA only, robust edition)
+# app_table_only.py  —  Groundwater forecasts (ARIMA, tables only)
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
 from pathlib import Path
 from datetime import datetime
 from sklearn.metrics import mean_squared_error
 from statsmodels.tsa.arima.model import ARIMA
 import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
-warnings.filterwarnings("ignore", category=UserWarning)   # tame statsmodels output
-
-st.set_page_config(page_title="Groundwater Forecasts (ARIMA Only)", layout="wide")
-st.title("Groundwater Forecasting — Depth View (ARIMA Only)")
+st.set_page_config(page_title="Groundwater Forecasts (Table Only)", layout="wide")
+st.title("Groundwater Forecasting — Table View")
 
 DATA_PATH = "GW data (missing filled).csv"
-HORIZON_M = 60  # 5-year horizon (months)
+HORIZON_M = 60      # 5-year horizon (months)
 
-# ---------- helpers -----------------------------------------------------------------
+# ---------- helpers ---------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def load_raw(path: str) -> pd.DataFrame | None:
-    """Load the CSV expected by the app (Year, Months, W1…Wn)."""
     if not Path(path).exists():
         return None
-    try:
-        df = pd.read_csv(path)
-        df["Date"] = pd.to_datetime(df["Year"].astype(str) + "-" +
-                                    df["Months"].astype(str).str.zfill(2) + "-01")
-        return df.sort_values("Date").reset_index(drop=True)
-    except Exception as e:
-        st.warning(f"Could not read **{path}** – {e}")
-        return None
+    df = pd.read_csv(path)
+    df["Date"] = pd.to_datetime(df["Year"].astype(str) + "-" +
+                                df["Months"].astype(str).str.zfill(2) + "-01")
+    return df.sort_values("Date").reset_index(drop=True)
 
 def clean_series(df: pd.DataFrame, well: str) -> pd.DataFrame:
-    """Outlier trim (3×IQR) + linear interpolation for missing."""
     s = df[well].copy()
-    q1, q3 = s.quantile([0.25, 0.75])
-    iqr = q3 - q1
+    q1, q3 = s.quantile([0.25, 0.75]); iqr = q3 - q1
     s = s.where(s.between(q1 - 3*iqr, q3 + 3*iqr)).interpolate(limit_direction="both")
     return pd.DataFrame({"Date": df["Date"], well: s}).dropna().reset_index(drop=True)
 
-def clip_bounds(series: pd.Series) -> tuple[float, float]:
-    """Extend the y-axis 20 % above & below data range for nicer plots."""
-    lo, hi = series.min(), series.max()
-    rng = hi - lo if hi > lo else max(hi, 1)
-    return max(0, lo - 0.20*rng), hi + 0.20*rng
-
 @st.cache_data(show_spinner=True)
-def train_arima(series: pd.Series, seasonal: bool,
-                lo: float, hi: float) -> tuple[dict, "ARIMAResults", pd.DataFrame]:
-    """Fit ARIMA and return metrics + 60-month forecast."""
-    split = int(len(series)*0.80)
+def train_arima(series: pd.Series, seasonal: bool, horizon: int) -> tuple[dict, pd.DataFrame]:
+    split = int(len(series)*0.8)
     train, test = series.iloc[:split], series.iloc[split:]
+    order, s_order = (1,1,1), (1,1,1,12) if seasonal else (0,0,0,0)
 
-    order = (1, 1, 1)
-    s_order = (1, 1, 1, 12) if seasonal else (0, 0, 0, 0)
-
-    try:
-        model = ARIMA(train, order=order, seasonal_order=s_order).fit()
-    except Exception as e:
-        raise RuntimeError(f"ARIMA failed to converge: {e}")
-
+    model = ARIMA(train, order=order, seasonal_order=s_order).fit()
     rmse = round(np.sqrt(mean_squared_error(test, model.forecast(len(test)))), 4)
-    model_full = ARIMA(series, order=order, seasonal_order=s_order).fit()
 
-    forecast = model_full.get_forecast(HORIZON_M)
+    model_full = ARIMA(series, order=order, seasonal_order=s_order).fit()
+    forecast = model_full.get_forecast(horizon)
     future = pd.DataFrame({
         "Date": pd.date_range(series.index[-1] + pd.DateOffset(months=1),
-                              periods=HORIZON_M, freq="MS"),
-        "Depth": np.clip(forecast.predicted_mean.values, lo, hi)
+                              periods=horizon, freq="MS"),
+        "Depth": forecast.predicted_mean.values.round(2)
     })
-    metrics = {"AIC": round(model_full.aic, 1),
-               "BIC": round(model_full.bic, 1),
+    metrics = {"AIC": round(model_full.aic,1),
+               "BIC": round(model_full.bic,1),
                "RMSE test": rmse}
-    return metrics, model_full, future
+    return metrics, future
 
-# ---------- session storage ---------------------------------------------------------
+# ---------- session storage -------------------------------------------------------
 if "summary_rows" not in st.session_state:
     st.session_state["summary_rows"] = []
 
-# ---------- UI ----------------------------------------------------------------------
+# ---------- UI --------------------------------------------------------------------
 raw = load_raw(DATA_PATH)
-
 if raw is None:
-    st.error("CSV not found or unreadable. Please upload a valid file.")
-    up = st.sidebar.file_uploader("Upload groundwater CSV", type="csv")
-    if up:
-        Path(DATA_PATH).write_bytes(up.read())
-        st.experimental_rerun()
+    st.error("CSV not found. Upload a groundwater file.")
+    if up := st.sidebar.file_uploader("Upload CSV", type="csv"):
+        Path(DATA_PATH).write_bytes(up.read()); st.experimental_rerun()
     st.stop()
 
 wells = [c for c in raw.columns if c.startswith("W")]
-well = st.sidebar.selectbox("Select well", wells)
+well = st.sidebar.selectbox("Well", wells)
 seasonal = st.sidebar.checkbox("Include 12-month seasonality", True)
 
 clean = clean_series(raw, well)
-
 if len(clean) < 30:
-    st.warning("Not enough data points (<30) to fit ARIMA reliably.")
-    st.stop()
+    st.warning("Not enough data points (<30) to fit ARIMA reliably."); st.stop()
 
-lo, hi = clip_bounds(clean[well])
 series = pd.Series(clean[well].values, index=clean["Date"])
 
-try:
-    metrics, model, future = train_arima(series, seasonal, lo, hi)
-except RuntimeError as e:
-    st.error(e.args[0])
-    st.stop()
+with st.spinner("Fitting ARIMA…"):
+    metrics, future = train_arima(series, seasonal, HORIZON_M)
 
-# ---------- Metrics -----------------------------------------------------------------
-st.subheader("📈 ARIMA metrics")
-st.json(metrics)
+# ---------- Show results ----------------------------------------------------------
+st.subheader("ARIMA metrics")
+st.table(pd.DataFrame(metrics, index=["Value"]))
 
-# ---------- Plot --------------------------------------------------------------------
-df_actual   = pd.DataFrame({"Date": clean["Date"], "Depth": clean[well], "Type": "Actual"})
-df_fitted   = pd.DataFrame({"Date": series.index,
-                            "Depth": model.fittedvalues.clip(lo, hi),
-                            "Type": "Predicted"})
-df_forecast = future.assign(Type="Forecast")
+st.subheader("5-year monthly forecast")
+st.dataframe(future, use_container_width=True)
 
-plot_df = pd.concat([df_actual, df_fitted, df_forecast])
-
-fig = px.line(plot_df, x="Date", y="Depth", color="Type",
-              title=f"{well} — ARIMA fit & 5-year forecast",
-              labels={"Depth": "Water-table depth (m)"})
-fig.update_yaxes(autorange="reversed")
-for tr in fig.data:
-    if tr.name == "Forecast":
-        tr.update(line=dict(dash="dash"))
-fig.add_vline(x=df_actual["Date"].max(), line_dash="dot", line_color="gray")
-st.plotly_chart(fig, use_container_width=True)
-
-# ---------- Forecast table ----------------------------------------------------------
-st.subheader("🗒️ 5-year forecast table")
-st.dataframe(df_forecast.style.format({"Depth": "{:.2f}"}), use_container_width=True)
-
-# ---------- Save summary ------------------------------------------------------------
-if st.button("💾 Save this forecast"):
+# ---------- Save summary ----------------------------------------------------------
+if st.button("💾 Save this forecast row"):
     row = {"Well": well}
-    yearly = (df_forecast.assign(Year=df_forecast["Date"].dt.year)
-                          .groupby("Year").first()["Depth"])
+    yearly = future.assign(Y=future["Date"].dt.year).groupby("Y").first()["Depth"]
     for yr in range(2025, 2030):
-        row[str(yr)] = round(yearly.get(yr, np.nan), 2)
+        row[str(yr)] = yearly.get(yr, np.nan)
     row.update(metrics)
     st.session_state["summary_rows"].append(pd.DataFrame([row]))
     st.success(f"Saved – total rows: {len(st.session_state['summary_rows'])}")
 
-# ---------- Sidebar download --------------------------------------------------------
+# ---------- Sidebar CSV download --------------------------------------------------
 n_rows = len(st.session_state["summary_rows"])
 st.sidebar.markdown(f"**Saved summaries:** {n_rows}")
 if n_rows:
     combined = pd.concat(st.session_state["summary_rows"]).reset_index(drop=True)
-    st.sidebar.download_button("⬇️ Download summary CSV",
+    st.sidebar.download_button("⬇️ Download summaries CSV",
                                combined.to_csv(index=False).encode(),
                                file_name=f"well_summaries_{datetime.today().date()}.csv",
                                mime="text/csv")
-    if st.sidebar.checkbox("Show summary table"):
-        st.subheader("📋 Combined saved summaries")
+    if st.sidebar.checkbox("Show combined table"):
+        st.subheader("Combined saved summaries")
         st.dataframe(combined, use_container_width=True)

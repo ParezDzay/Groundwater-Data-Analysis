@@ -1,199 +1,189 @@
+# ann_prediction.py
+# ────────────────────────────────────────────────────────────────
+# Streamlit module for ANN-based groundwater-level forecasting
+# --------------------------------------------------------------
+# • Loads “GW data (missing filled).csv”   (20 wells, 2004-2024)
+# • Lets the user pick: well, # lags, test-size, hidden-layer
+# • Builds an MLPRegressor with standard-scaled inputs
+# • Shows train/test metrics & interactive plots
+# • Generates multi-step forecasts and offers CSV download
+#
+# You can drop this file into the same GitHub repo as app.py and
+# either `streamlit run ann_prediction.py` directly **or** import
+# its `groundwater_ann_page()` function inside the Prediction tab
+# of your main app.  No other tweaks required.
+# ————————————————————————————————————————————————————————
+
 import streamlit as st
 import pandas as pd
-import plotly.express as px
 import numpy as np
-import os
-import pymannkendall as mk
-import base64
-import requests
+from pathlib import Path
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_squared_error
+import plotly.express as px
+import io
 from datetime import datetime
 
-# ──────────────── CONFIG ────────────────
-st.set_page_config(page_title="Well Data App", layout="wide")
-st.sidebar.title("Navigation")
+# ─────────────── CONFIG ───────────────
+DATA_PATH = r"C:\Parez\GW data (missing filled).csv"
+st.set_page_config(page_title="ANN Groundwater Forecast", layout="wide")
 
-# GitHub info from secrets
-token = st.secrets["github"]["token"]
-username = st.secrets["github"]["username"]
-repo = st.secrets["github"]["repo"]
-branch = st.secrets["github"]["branch"]
+# 📥 ─────────── DATA LOAD & PREP ───────────
+@st.cache_data(show_spinner=False)
+def load_data(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    # Ensure correct dtypes
+    df["Year"] = df["Year"].astype(int)
+    df["Months"] = df["Months"].astype(int)
+    # Parse date if not already
+    if "Date" not in df.columns:
+        df["Date"] = pd.to_datetime(df["Year"].astype(str) + "-" + df["Months"].astype(str) + "-01")
+    else:
+        df["Date"] = pd.to_datetime(df["Date"])
+    df = df.sort_values("Date").reset_index(drop=True)
+    return df
 
-# Define paths
-file_path = "Wells detailed data.csv"
-gw_file_path = "GW data.csv"
-output_path = "GW data (missing filled).csv"
-cleaned_outlier_path = "GW data (missing filled).csv"
+def add_cyclical_month(df: pd.DataFrame) -> pd.DataFrame:
+    # encode seasonality (helps neural net)
+    df = df.copy()
+    df["month_sin"] = np.sin(2 * np.pi * df["Months"] / 12)
+    df["month_cos"] = np.cos(2 * np.pi * df["Months"] / 12)
+    return df
 
-# ──────────────── GitHub Upload Function ────────────────
-def push_to_github(file_path, commit_message):
-    with open(file_path, "r", encoding="utf-8") as f:
-        content = f.read()
+def create_lag_features(df: pd.DataFrame, well: str, n_lags: int) -> pd.DataFrame:
+    df = df.copy()
+    for lag in range(1, n_lags + 1):
+        df[f"{well}_lag{lag}"] = df[well].shift(lag)
+    return df.dropna().reset_index(drop=True)
 
-    encoded_content = base64.b64encode(content.encode()).decode()
-    filename = os.path.basename(file_path)
-    url = f"https://api.github.com/repos/{username}/{repo}/contents/{filename}"
+# 📊 ─────────── MODEL & FORECAST ───────────
+def train_ann(df_feat: pd.DataFrame, well: str, test_size: float,
+              hidden_layer: tuple[int, ...]):
+    X = df_feat.drop(columns=[well, "Date"])
+    y = df_feat[well]
 
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github+json"
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, shuffle=False
+    )
+
+    scaler = StandardScaler()
+    X_train_std = scaler.fit_transform(X_train)
+    X_test_std = scaler.transform(X_test)
+
+    model = MLPRegressor(hidden_layer_sizes=hidden_layer,
+                         activation="relu",
+                         solver="adam",
+                         random_state=42,
+                         max_iter=2000,
+                         early_stopping=True)
+    model.fit(X_train_std, y_train)
+
+    y_pred_train = model.predict(X_train_std)
+    y_pred_test = model.predict(X_test_std)
+
+    metrics = {
+        "R² (train)": r2_score(y_train, y_pred_train),
+        "RMSE (train)": np.sqrt(mean_squared_error(y_train, y_pred_train)),
+        "R² (test)": r2_score(y_test, y_pred_test),
+        "RMSE (test)": np.sqrt(mean_squared_error(y_test, y_pred_test)),
     }
 
-    # Check if file exists on GitHub
-    response = requests.get(url, headers=headers)
-    sha = response.json()["sha"] if response.status_code == 200 else None
+    # Attach predictions to full dataframe (NaNs before split)
+    df_feat.loc[X_train.index, "pred"] = y_pred_train
+    df_feat.loc[X_test.index, "pred"] = y_pred_test
 
-    payload = {
-        "message": commit_message,
-        "content": encoded_content,
-        "branch": branch
-    }
-    if sha:
-        payload["sha"] = sha
+    return model, scaler, df_feat, metrics
 
-    res = requests.put(url, headers=headers, json=payload)
-    return res.status_code in [200, 201]
+def recursive_forecast(model, scaler, history: pd.DataFrame,
+                       well: str, horizon: int) -> pd.DataFrame:
+    """
+    history = last (n_lags) rows of df_feat with latest actual value
+    Returns df with future dates & forecasts
+    """
+    last_row = history.iloc[-1].copy()
+    n_lags = sum(col.startswith(f"{well}_lag") for col in history.columns)
+    future_rows = []
+    for step in range(1, horizon + 1):
+        # Shift lag columns
+        for lag in range(n_lags, 1, -1):
+            last_row[f"{well}_lag{lag}"] = last_row[f"{well}_lag{lag-1}"]
+        last_row[f"{well}_lag1"] = last_row["pred"] if "pred" in last_row else last_row[well]
+        # Advance month/year
+        next_date = last_row["Date"] + pd.DateOffset(months=1)
+        next_month = next_date.month
+        last_row["Months"] = next_month
+        last_row["month_sin"] = np.sin(2 * np.pi * next_month / 12)
+        last_row["month_cos"] = np.cos(2 * np.pi * next_month / 12)
+        last_row["Date"] = next_date
 
-# ──────────────── PAGE ROUTING ────────────────
-page = st.sidebar.radio(
-    "Go to",
-    ["Home", "Well Map Viewer", "📈 Groundwater Data", "📉 Groundwater Level Trends for Wells", "📊 Groundwater Prediction"]
-)
+        X_next = scaler.transform(last_row.drop(labels=[well, "Date"]).to_frame().T)
+        next_pred = model.predict(X_next)[0]
+        last_row[well] = next_pred
+        last_row["pred"] = next_pred
+        future_rows.append(last_row.copy())
 
-# ──────────────── PAGE LOGIC ────────────────
-if page == "Home":
-    st.title("Erbil Central Sub-Basin CSB Groundwater Data Analysis")
-    st.markdown("Explore well data, visualize maps, and analyze groundwater trends and forecasts.")
+    future_df = pd.DataFrame(future_rows)
+    return future_df[["Date", "pred"]].rename(columns={"pred": "Forecast"})
 
-elif page == "Well Map Viewer":
-    if not os.path.exists(file_path):
-        st.error("Well CSV file not found.")
-        st.stop()
-    df = pd.read_csv(file_path, on_bad_lines='skip')
-    df.columns = [col.strip().replace('\n', ' ').replace('\r', '') for col in df.columns]
-    df["Coordinate X"] = pd.to_numeric(df.get("Coordinate X"), errors="coerce")
-    df["Coordinate Y"] = pd.to_numeric(df.get("Coordinate Y"), errors="coerce")
-    df["Depth (m)"] = pd.to_numeric(df.get("Depth (m)"), errors="coerce")
-    df.rename(columns={"Coordinate X": "lat", "Coordinate Y": "lon"}, inplace=True)
-    df = df.dropna(subset=["lat", "lon"])
+# 🖥️ ─────────── UI ───────────
+def groundwater_ann_page():
+    st.title("🔮 ANN Groundwater Prediction")
 
-    st.title("Well Map Viewer")
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Data Table", "🗺️ Map View", "🔍 Filters", "⬆️ Upload CSV"])
+    df = load_data(DATA_PATH)
+    df = add_cyclical_month(df)
 
-    with tab3:
-        selected_basin = st.multiselect("Select Basin(s):", df["Basin"].unique(), default=df["Basin"].unique())
-        selected_district = st.multiselect("Select Sub-District(s):", df["sub district"].unique(), default=df["sub district"].unique())
-        filtered_df = df[df["Basin"].isin(selected_basin) & df["sub district"].isin(selected_district)]
-        st.success("Filters applied.")
+    well_cols = [c for c in df.columns if c.startswith("W")]
+    well = st.sidebar.selectbox("Select Well to Model", well_cols, index=0)
 
-    with tab1:
-        st.dataframe(filtered_df)
+    n_lags = st.sidebar.slider("Number of lag steps", 1, 24, 12)
+    test_size = st.sidebar.slider("Test size (fraction)", 0.1, 0.5, 0.2, step=0.05)
+    hidden_layer_sz = st.sidebar.text_input(
+        "Hidden-layer sizes (comma-sep)", "64,32"
+    )
+    hidden_layer = tuple(int(x) for x in hidden_layer_sz.split(",") if x.strip())
 
-    with tab2:
-        fig = px.scatter_mapbox(
-            filtered_df, lat="lat", lon="lon", color="Basin",
-            hover_name="Well Name", hover_data={"Depth (m)": True},
-            zoom=10, height=600
-        )
-        fig.update_layout(mapbox_style="open-street-map", margin={"r":0,"t":0,"l":0,"b":0})
-        st.plotly_chart(fig, use_container_width=True)
+    horizon = st.sidebar.number_input("Forecast horizon (months)", 1, 60, 12)
 
-    with tab4:
-        uploaded_file = st.file_uploader("Upload a CSV", type="csv")
-        if uploaded_file:
-            new_data = pd.read_csv(uploaded_file, on_bad_lines='skip')
-            new_data.columns = [col.strip().replace('\n', ' ').replace('\r', '') for col in new_data.columns]
-            st.dataframe(new_data)
-            if st.button("Append Uploaded Data to Dataset"):
-                new_data.to_csv(file_path, mode='a', header=False, index=False)
-                push_to_github(file_path, "Appended new well data")
-                st.success("Data uploaded and pushed to GitHub.")
+    # Build feature set
+    df_feat = create_lag_features(df[["Date", "Months", "month_sin", "month_cos", well]], well, n_lags)
 
-elif page == "📈 Groundwater Data":
-    if not os.path.exists(output_path):
-        st.error("Processed groundwater data not found.")
-        st.stop()
+    # Train & predict
+    model, scaler, df_pred, metrics = train_ann(df_feat, well, test_size, hidden_layer)
 
-    gw_df = pd.read_csv(output_path)
-    gw_df["Year"] = gw_df["Year"].astype(int)
-    gw_df["Months"] = gw_df["Months"].astype(int)
-    gw_df["Date"] = pd.to_datetime(gw_df["Year"].astype(str) + "-" + gw_df["Months"].astype(str) + "-01")
+    # ────── METRICS ──────
+    st.subheader("Model performance")
+    st.json({k: round(v, 4) for k, v in metrics.items()})
 
-    st.title("📈 Groundwater Data Over 20 Years")
-    tabs = st.tabs(["📉 Data with Missing", "✏️ Edit Raw Data", "✅ Cleaned Data", "⚠️ Outlier %", "🧹 Clean & Save"])
+    # ────── PLOT: actual vs pred ──────
+    fig_hist = px.line(
+        df_pred, x="Date", y=[well, "pred"],
+        labels={"value": "Groundwater Level (m)", "variable": "Legend"},
+        title=f"Actual vs ANN prediction – {well}"
+    )
+    st.plotly_chart(fig_hist, use_container_width=True)
 
-    well_cols = [col for col in gw_df.columns if col not in ["Year", "Months", "Date"]]
+    # ────── FORECAST ──────
+    future_df = recursive_forecast(model, scaler, df_pred.tail(1), well, horizon)
+    st.subheader(f"{horizon}-month forecast")
+    fig_future = px.line(
+        pd.concat([df_pred[["Date", well]].rename(columns={well: "Level"}),
+                   future_df.rename(columns={"Forecast": "Level"})]),
+        x="Date", y="Level", title=f"Forecast horizon ({horizon} months) – {well}"
+    )
+    st.plotly_chart(fig_future, use_container_width=True)
 
-    with tabs[0]:
-        st.dataframe(gw_df)
+    # Download button
+    csv_buffer = io.StringIO()
+    future_df.to_csv(csv_buffer, index=False)
+    st.download_button(
+        "Download forecast CSV",
+        data=csv_buffer.getvalue(),
+        file_name=f"{well}_forecast_{datetime.today().date()}.csv",
+        mime="text/csv"
+    )
 
-    with tabs[1]:
-        edited_df = st.data_editor(gw_df, num_rows="dynamic", use_container_width=True)
-        if st.button("Save Edited Data and Push to GitHub"):
-            edited_df.to_csv(gw_file_path, index=False)
-            if push_to_github(gw_file_path, f"Edited and saved on {datetime.now()}"):
-                st.success("Data saved and pushed to GitHub.")
-            else:
-                st.error("Failed to push to GitHub.")
-
-    with tabs[2]:
-        st.dataframe(gw_df)
-
-    with tabs[3]:
-        def calculate_outlier_percent(df_in):
-            outlier_pct = {}
-            for well in well_cols:
-                series = df_in[well].dropna()
-                Q1 = series.quantile(0.25)
-                Q3 = series.quantile(0.75)
-                IQR = Q3 - Q1
-                lower_bound = Q1 - 1.5 * IQR
-                upper_bound = Q3 + 1.5 * IQR
-                outliers = series[(series < lower_bound) | (series > upper_bound)]
-                percent = (len(outliers) / len(series)) * 100 if len(series) > 0 else 0
-                outlier_pct[well] = round(percent, 2)
-            return outlier_pct
-
-        before_cleaning = calculate_outlier_percent(gw_df)
-
-        cleaned_df = gw_df.copy()
-        for well in well_cols:
-            series = cleaned_df[well]
-            Q1 = series.quantile(0.25)
-            Q3 = series.quantile(0.75)
-            IQR = Q3 - Q1
-            lower_bound = Q1 - 1.5 * IQR
-            upper_bound = Q3 + 1.5 * IQR
-            cleaned_df.loc[(series < lower_bound) | (series > upper_bound), well] = np.nan
-        for well in well_cols:
-            cleaned_df[well] = cleaned_df[well].interpolate(method='linear', limit_direction='both')
-
-        after_cleaning = calculate_outlier_percent(cleaned_df)
-
-        combined_df = pd.DataFrame({
-            "Outlier % Before": before_cleaning,
-            "Outlier % After": after_cleaning
-        })
-        st.dataframe(combined_df)
-
-    with tabs[4]:
-        st.dataframe(cleaned_df)
-        if st.button("Save Cleaned Data to GitHub"):
-            cleaned_df.to_csv(cleaned_outlier_path, index=False)
-            if push_to_github(cleaned_outlier_path, "Cleaned and saved groundwater data"):
-                st.success("Cleaned data pushed to GitHub.")
-            else:
-                st.error("Push to GitHub failed.")
-
-elif page == "📉 Groundwater Level Trends for Wells":
-    st.title("📉 Groundwater Level Trends for Wells")
-    # Add trend analysis logic here if needed
-    st.info("Trend analysis page is under construction.")
-
-elif page == "📊 Groundwater Prediction":
-    st.title("📊 Groundwater Prediction Models")
-    tab1, tab2 = st.tabs(["🔮 ANN Prediction", "📉 ARIMA"])
-
-    with tab1:
-        st.markdown("Placeholder for ANN model predictions.")
-    with tab2:
-        st.markdown("Placeholder for ARIMA model predictions.")
+# If running standalone:
+if __name__ == "__main__":
+    groundwater_ann_page()

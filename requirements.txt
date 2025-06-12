@@ -2,4 +2,6 @@ streamlit
 pandas
 numpy
 plotly
+scikit-learn    
 pymannkendall
+requests

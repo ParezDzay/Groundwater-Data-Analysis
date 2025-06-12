@@ -1,8 +1,9 @@
-# app.py — streamlined ANN-only groundwater forecaster
-# ----------------------------------------------------
+# app.py — ANN-only groundwater forecaster (depth view)
+# -----------------------------------------------------
 # • Loads “GW data (missing filled).csv”
-# • Lets you pick well, lags, test split, hidden layers, horizon
+# • User chooses well, lags, test split, hidden layers, horizon
 # • Trains an MLPRegressor, shows depth-inverted plots, downloads CSV
+# • Fixed: forecast step now drops extra “pred” column → no ValueError
 
 import streamlit as st
 import pandas as pd
@@ -21,7 +22,7 @@ st.title("🔮 ANN Groundwater Prediction (Depth View)")
 
 DATA_PATH = "GW data (missing filled).csv"
 
-# ---------- helpers ----------
+# ───────── helpers ─────────
 @st.cache_data(show_spinner=False)
 def load_data(path):
     if not Path(path).exists():
@@ -71,30 +72,35 @@ def fit_ann(df_feat, well, test_size, layers):
     return model, scaler, df_feat, metrics
 
 def recursive_forecast(model, scaler, last_row, well, lags, horizon):
-    forecasts = []
-    r = last_row.copy()
+    """Iterative forecast—drops columns not seen by scaler (e.g., 'pred')."""
+    features = list(scaler.feature_names_in_)  # columns used during training
+    rows, r = [], last_row.copy()
+
     for _ in range(horizon):
+        # shift lag columns
         for k in range(lags, 1, -1):
             r[f"{well}_lag{k}"] = r[f"{well}_lag{k-1}"]
         r[f"{well}_lag1"] = r["pred"]
 
-        next_date = r["Date"] + pd.DateOffset(months=1)
+        # advance date + cyclical encodings
+        nxt = r["Date"] + pd.DateOffset(months=1)
         r.update({
-            "Date": next_date,
-            "Months": next_date.month,
-            "month_sin": np.sin(2 * np.pi * next_date.month / 12),
-            "month_cos": np.cos(2 * np.pi * next_date.month / 12)
+            "Date": nxt,
+            "Months": nxt.month,
+            "month_sin": np.sin(2 * np.pi * nxt.month / 12),
+            "month_cos": np.cos(2 * np.pi * nxt.month / 12)
         })
 
-        X_next = scaler.transform(r.drop(labels=[well, "Date"]).to_frame().T)
-        next_val = model.predict(X_next)[0]
+        # prepare feature vector exactly in training order
+        X_next = r[features].to_frame().T.values
+        val = model.predict(X_next)[0]
 
-        r[well] = r["pred"] = next_val
-        forecasts.append({"Date": next_date, "Depth": next_val})
+        r[well] = r["pred"] = val
+        rows.append({"Date": nxt, "Depth": val})
 
-    return pd.DataFrame(forecasts)
+    return pd.DataFrame(rows)
 
-# ---------- UI ----------
+# ───────── UI ─────────
 df = load_data(DATA_PATH)
 if df is None:
     st.error(f"CSV '{DATA_PATH}' not found. Upload it to continue.")

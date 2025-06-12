@@ -1,6 +1,8 @@
-# app.py — Groundwater forecasts (ANN with clipping + ARIMA with RMSE)
-# -------------------------------------------------------------------
-# Fix: parenthesis/bracket mismatch on the ARIMA df_fit line ➜ corrected.
+# app.py — Groundwater forecasts (ANN with full metrics + clipping; ARIMA with RMSE)
+# ---------------------------------------------------------------------------------
+# ANN shows:  R² train, RMSE train, R² test, RMSE test   (like earlier version)
+# ARIMA shows: AIC, BIC, RMSE test
+# Forecasts are clipped to a well-specific reasonable band.
 
 import streamlit as st, pandas as pd, numpy as np, plotly.express as px
 from pathlib import Path; from datetime import datetime
@@ -18,8 +20,7 @@ DATA_PATH, FORE_HORIZON = "GW data (missing filled).csv", 60  # 5 years
 # ---------- helpers ----------
 @st.cache_data(show_spinner=False)
 def load_raw(path):
-    if not Path(path).exists():
-        return None
+    if not Path(path).exists(): return None
     df = pd.read_csv(path)
     df["Date"] = pd.to_datetime(df["Year"].astype(str) + "-" +
                                 df["Months"].astype(str) + "-01")
@@ -60,12 +61,17 @@ def train_ann(df_feat, well, layers, lags, scaler_type, lo, hi):
                        random_state=42, early_stopping=True)
     mdl.fit(scaler.fit_transform(Xtr), ytr)
 
-    df_feat.loc[Xtr.index, "pred"] = np.clip(mdl.predict(scaler.transform(Xtr)), lo, hi)
-    df_feat.loc[Xte.index, "pred"] = np.clip(mdl.predict(scaler.transform(Xte)), lo, hi)
+    ytr_pred = np.clip(mdl.predict(scaler.transform(Xtr)), lo, hi)
+    yte_pred = np.clip(mdl.predict(scaler.transform(Xte)), lo, hi)
+
+    df_feat.loc[Xtr.index, "pred"] = ytr_pred
+    df_feat.loc[Xte.index, "pred"] = yte_pred
 
     metrics = {
-        "RMSE test": round(np.sqrt(mean_squared_error(
-            yte, df_feat.loc[Xte.index, "pred"])), 4)
+        "R² train":  round(r2_score(ytr, ytr_pred), 4),
+        "RMSE train": round(np.sqrt(mean_squared_error(ytr, ytr_pred)), 4),
+        "R² test":   round(r2_score(yte, yte_pred), 4),
+        "RMSE test": round(np.sqrt(mean_squared_error(yte, yte_pred)), 4)
     }
 
     feats = scaler.feature_names_in_
@@ -131,7 +137,6 @@ wells = [c for c in raw.columns if c.startswith("W")]
 well = st.sidebar.selectbox("Well", wells)
 model = st.sidebar.radio("Model", ["🔮 ANN", "📈 ARIMA"])
 
-# cleaned series for this well
 clean = clean_series(raw, well)
 lo, hi = clip_bounds(clean[well])
 

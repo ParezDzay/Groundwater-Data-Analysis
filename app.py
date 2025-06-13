@@ -1,4 +1,4 @@
-# fast_forecast_app.py  —  Seasonal-Naïve, Holt-Winters, VAR, Random-Forest
+# fast_forecast_app.py  —  SARIMA, LSTM, CNN-LSTM
 
 import streamlit as st
 import pandas as pd
@@ -6,14 +6,17 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 from sklearn.metrics import mean_squared_error
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
-from statsmodels.tsa.api import VAR
-from sklearn.ensemble import RandomForestRegressor
-import os, warnings
+from sklearn.preprocessing import MinMaxScaler
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM, Conv1D, MaxPooling1D, Flatten
+from tensorflow.keras.callbacks import EarlyStopping
+import os, warnings, tensorflow as tf
 warnings.filterwarnings("ignore", category=UserWarning)
+tf.get_logger().setLevel("ERROR")          # silence TF startup spam
 
-st.set_page_config(page_title="Groundwater Fast Forecast", layout="wide")
-st.title("Groundwater Forecasting — Fast Table View")
+st.set_page_config(page_title="Groundwater Deep-&-Classic Forecast", layout="wide")
+st.title("Groundwater Forecasting — SARIMA & Deep Learning")
 
 DATA_PATH, HORIZON_M = "GW data (missing filled).csv", 60
 SUMMARY_CSV = "yearly_summaries.csv"
@@ -34,66 +37,85 @@ def clean_series(df, well):
     s = s.where(s.between(q1 - 3*iqr, q3 + 3*iqr)).interpolate(limit_direction="both")
     return pd.Series(s.values, index=df["Date"])
 
-def clean_multivariate(df, wells):
-    """Apply the same cleaning to every well and return a Date-indexed dataframe."""
-    out = {}
-    for w in wells:
-        out[w] = clean_series(df, w)
-    return pd.DataFrame(out).dropna()
+# ----------------------------------------------------------------- SARIMA ----------
+def sarima_forecast(series, horizon, seasonal=True):
+    order = (1,1,1)
+    s_order = (1,1,1,12) if seasonal else (0,0,0,0)
+    train_end = int(len(series)*0.8)
+    train, test = series.iloc[:train_end], series.iloc[train_end:]
+    mdl = SARIMAX(train, order=order, seasonal_order=s_order,
+                  enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+    rmse = round(np.sqrt(mean_squared_error(test, mdl.forecast(len(test)))), 4)
+    mdl_full = SARIMAX(series, order=order, seasonal_order=s_order,
+                       enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+    idx = pd.date_range(series.index[-1] + pd.DateOffset(months=1),
+                        periods=horizon, freq="MS")
+    fc = pd.Series(mdl_full.forecast(horizon).round(2), index=idx)
+    return {"AIC": round(mdl_full.aic,1), "BIC": round(mdl_full.bic,1), "RMSE test": rmse}, fc
 
-# ---------- forecasting back-ends ---------------------------------------------------
-def seasonal_naive_forecast(series, horizon):
-    y_pred = series.shift(12).dropna()
-    rmse   = round(np.sqrt(mean_squared_error(series.loc[y_pred.index], y_pred)), 4)
-    idx    = pd.date_range(series.index[-1] + pd.DateOffset(months=1), periods=horizon, freq="MS")
-    vals   = np.tile(series.iloc[-12:], int(np.ceil(horizon/12)))[:horizon]
-    return {"RMSE test": rmse}, pd.Series(vals.round(2), index=idx)
+# ------------------------------------------------------------- LSTM helpers --------
+def build_lstm(input_shape, units=64):
+    model = Sequential([
+        LSTM(units, activation="tanh", input_shape=input_shape),
+        Dense(1)
+    ])
+    model.compile(optimizer="adam", loss="mse")
+    return model
 
-def holt_winters_forecast(series, horizon):
-    mdl   = ExponentialSmoothing(series, trend="add", seasonal="add",
-                                 seasonal_periods=12,
-                                 initialization_method="estimated").fit()
-    rmse  = round(np.sqrt(mean_squared_error(series, mdl.fittedvalues)), 4)
-    idx   = pd.date_range(series.index[-1] + pd.DateOffset(months=1), periods=horizon, freq="MS")
-    fc    = pd.Series(mdl.forecast(horizon).round(2), index=idx)
-    return {"AIC": round(mdl.aic,1), "RMSE train": rmse}, fc
+def build_cnn_lstm(input_shape, filters=32, kernel=3, units=32):
+    model = Sequential([
+        Conv1D(filters, kernel_size=kernel, activation="relu", input_shape=input_shape),
+        MaxPooling1D(pool_size=2),
+        Flatten(),
+        Dense(units, activation="relu"),
+        Dense(1)
+    ])
+    model.compile(optimizer="adam", loss="mse")
+    return model
 
-def var_forecast(df_wells, target_well, horizon, lag_order=12):
-    """Fit VAR on all wells, forecast `horizon` months, return target well only."""
-    train = df_wells.iloc[:-horizon] if len(df_wells) > horizon+lag_order else df_wells
-    model = VAR(train)
-    res   = model.fit(lag_order, ic=None, trend="c")
-    # simple test RMSE on last horizon points (if we withheld them)
-    if len(df_wells) > horizon+lag_order:
-        test_pred = res.forecast(train.values[-lag_order:], horizon)
-        rmse = round(np.sqrt(mean_squared_error(
-            df_wells[target_well].iloc[-horizon:], test_pred[:, df_wells.columns.get_loc(target_well)])), 4)
+def make_supervised(s: np.ndarray, n_lags: int):
+    X, y = [], []
+    for i in range(n_lags, len(s)):
+        X.append(s[i-n_lags:i])
+        y.append(s[i])
+    return np.array(X), np.array(y)
+
+def deep_forecast(series, horizon, n_lags=12, epochs=30, batch=16, model_type="lstm"):
+    # scale 0-1 for neural nets
+    scaler = MinMaxScaler()
+    s_scaled = scaler.fit_transform(series.values.reshape(-1,1)).flatten()
+    X, y = make_supervised(s_scaled, n_lags)
+    split = int(len(X)*0.8)
+    Xtr, Xte, ytr, yte = X[:split], X[split:], y[:split], y[split:]
+
+    # reshape for keras [samples, timesteps, features]
+    Xtr = Xtr.reshape((Xtr.shape[0], Xtr.shape[1], 1))
+    Xte = Xte.reshape((Xte.shape[0], Xte.shape[1], 1))
+
+    if model_type == "lstm":
+        net = build_lstm((n_lags,1))
     else:
-        rmse = np.nan
-    future_vals = res.forecast(df_wells.values[-lag_order:], horizon)[:, df_wells.columns.get_loc(target_well)]
-    idx = pd.date_range(df_wells.index[-1] + pd.DateOffset(months=1), periods=horizon, freq="MS")
-    return {"Lag order": lag_order, "RMSE test": rmse}, pd.Series(future_vals.round(2), index=idx)
+        net = build_cnn_lstm((n_lags,1))
 
-def rf_forecast(series, horizon, n_lags=12, n_estimators=300, random_state=42):
-    """Lag-feature Random‐Forest, iterative multi-step forecast."""
-    # build lag matrix
-    df_lag = pd.concat({f"lag{k}": series.shift(k) for k in range(1, n_lags+1)}, axis=1).dropna()
-    X, y   = df_lag.values, series.loc[df_lag.index].values
-    split  = int(len(X)*0.8)
-    rf     = RandomForestRegressor(n_estimators=n_estimators,
-                                   random_state=random_state).fit(X[:split], y[:split])
-    rmse   = round(np.sqrt(mean_squared_error(y[split:], rf.predict(X[split:]))), 4)
+    net.fit(Xtr, ytr, validation_data=(Xte, yte),
+            epochs=epochs, batch_size=batch,
+            verbose=0, callbacks=[EarlyStopping(patience=5, restore_best_weights=True)])
 
-    last_vals = list(series.iloc[-n_lags:])
-    fc_vals   = []
+    rmse = round(np.sqrt(mean_squared_error(yte, net.predict(Xte, verbose=0).flatten())), 4)
+
+    # iterative forecast
+    history = list(s_scaled[-n_lags:])
+    fc_vals = []
     for _ in range(horizon):
-        x_pred   = np.array(last_vals[-n_lags:][::-1])    # lag1 = latest
-        next_val = rf.predict(x_pred.reshape(1, -1))[0]
-        fc_vals.append(round(next_val,2))
-        last_vals.append(next_val)
+        x_input = np.array(history[-n_lags:]).reshape((1,n_lags,1))
+        yhat = net.predict(x_input, verbose=0)[0][0]
+        fc_vals.append(yhat)
+        history.append(yhat)
 
-    idx = pd.date_range(series.index[-1] + pd.DateOffset(months=1), periods=horizon, freq="MS")
-    return {"Lags": n_lags, "RMSE test": rmse}, pd.Series(fc_vals, index=idx)
+    fc_vals = scaler.inverse_transform(np.array(fc_vals).reshape(-1,1)).flatten().round(2)
+    idx = pd.date_range(series.index[-1] + pd.DateOffset(months=1),
+                        periods=horizon, freq="MS")
+    return {"RMSE test": rmse, "Lags": n_lags, "Epochs": epochs}, pd.Series(fc_vals, index=idx)
 
 # ---------- UI ---------------------------------------------------------------------
 raw = load_raw(DATA_PATH)
@@ -106,34 +128,33 @@ if raw is None:
 wells = [c for c in raw.columns if c.startswith("W")]
 well  = st.sidebar.selectbox("Well", wells)
 model_choice = st.sidebar.radio(
-    "Model",
-    ["Seasonal Naïve (super-fast)",
-     "Holt-Winters (fast)",
-     "Vector Auto-Regression (VAR)",
-     "Random-Forest (lags)"]
-)
+    "Select model",
+    ["SARIMA / SARIMAX (classic)",
+     "LSTM (deep learning)",
+     "CNN-LSTM (hybrid deep)"])
 
 series = clean_series(raw, well)
-if len(series) < 24:
-    st.warning("Need ≥24 points for forecasting."); st.stop()
+if len(series) < 36:
+    st.warning("Need ≥36 points for these models."); st.stop()
 
-# extra setting for RF
-if model_choice.startswith("Random"):
-    n_lags = st.sidebar.slider("RF: number of lags", 6, 24, 12, step=2)
+# extra sliders for deep nets
+if model_choice.startswith("LSTM") or model_choice.startswith("CNN"):
+    n_lags = st.sidebar.slider("Number of lags (timesteps)", 6, 24, 12, step=2)
+    epochs = st.sidebar.slider("Training epochs", 10, 100, 30, step=10)
 
-with st.spinner("Calculating forecast…"):
-    if model_choice.startswith("Seasonal"):
-        metrics, future = seasonal_naive_forecast(series, HORIZON_M)
+with st.spinner("Fitting / forecasting…"):
+    if model_choice.startswith("SARIMA"):
+        metrics, future = sarima_forecast(series, HORIZON_M)
 
-    elif model_choice.startswith("Holt"):
-        metrics, future = holt_winters_forecast(series, HORIZON_M)
+    elif model_choice.startswith("LSTM"):
+        metrics, future = deep_forecast(series, HORIZON_M,
+                                        n_lags=n_lags, epochs=epochs,
+                                        model_type="lstm")
 
-    elif model_choice.startswith("Vector"):
-        df_all = clean_multivariate(raw, wells).loc[series.index]  # align dates
-        metrics, future = var_forecast(df_all, well, HORIZON_M)
-
-    else:  # Random-Forest
-        metrics, future = rf_forecast(series, HORIZON_M, n_lags=n_lags)
+    else:  # CNN-LSTM
+        metrics, future = deep_forecast(series, HORIZON_M,
+                                        n_lags=n_lags, epochs=epochs,
+                                        model_type="cnn")
 
 # ---------- display ----------------------------------------------------------------
 st.subheader("Model & accuracy")
@@ -142,7 +163,7 @@ st.table(pd.DataFrame(metrics, index=["Value"]))
 st.subheader("5-year monthly forecast")
 st.dataframe(future.to_frame("Depth"), use_container_width=True)
 
-# ---------- save yearly summary ----------------------------------------------------
+# ---------- yearly summary save ----------------------------------------------------
 if st.button("💾 Save yearly summary"):
     row = {"Well": well}
     yearly = future.resample("A").mean()
@@ -173,5 +194,3 @@ if os.path.exists(SUMMARY_CSV):
     with open(SUMMARY_CSV, "rb") as f:
         st.sidebar.download_button("⬇️ Download saved CSV file",
                                    f.read(), SUMMARY_CSV, "text/csv")
-
-

@@ -1,7 +1,7 @@
 streamlit
 pandas
-numpy==1.26.4
+numpy
 plotly
 scikit-learn
 statsmodels
-tensorflow-cpu==2.15.0
+tensorflow-cpu

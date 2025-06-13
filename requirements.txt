@@ -4,4 +4,4 @@ numpy
 plotly
 scikit-learn
 statsmodels
-tensorflow
+tensorflow-cpu

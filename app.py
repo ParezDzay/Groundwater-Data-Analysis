@@ -1,18 +1,21 @@
-# app.py — Groundwater Forecasting (SARIMA · LSTM · CNN-LSTM · RF-lags)
-# --------------------------------------------------------------------
-# ▸ Upload groundwater CSV (Year, Months, W1…Wn)
-# ▸ Choose a well + model → 60-month forecast table
-# ▸ “Save yearly summary” appends to yearly_summaries.csv
+# app.py — Groundwater Forecasting
+# Models: SARIMA · Random-Forest (lags) · LSTM · CNN-LSTM   (TF optional)
+# ----------------------------------------------------------------------
+# • Upload groundwater CSV (Year, Months, W1…Wn)
+# • Choose model + “Scope”:
+#       – Single well   → detailed metrics + monthly forecast + yearly table
+#       – All wells     → one-click yearly-average table for every well
+# • “Save yearly summary” works in single-well scope
 #
-# runtime.txt    : python-3.11.8          ← needed for TF 2.15 wheels
-# requirements   : streamlit==1.45.1
-#                  pandas==2.3.0
-#                  numpy==1.26.4
-#                  plotly==6.1.2
-#                  scikit-learn==1.4.2
-#                  statsmodels==0.14.4
-#                  tensorflow-cpu==2.15.0   (# optional; deep models disabled if absent)
-# --------------------------------------------------------------------
+# runtime.txt   : python-3.11.8
+# requirements  : streamlit==1.45.1
+#                 pandas==2.3.0
+#                 numpy==1.26.4
+#                 plotly==6.1.2
+#                 scikit-learn==1.4.2
+#                 statsmodels==0.14.4
+#                 tensorflow-cpu==2.15.0   # optional – deep models disabled if absent
+# ----------------------------------------------------------------------
 
 import streamlit as st
 import pandas as pd
@@ -26,7 +29,7 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 import os, warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# ───────────────────────── Optional TensorFlow import ──────────────────────────
+# ───────── Optional TensorFlow import ─────────
 try:
     import tensorflow as tf
     from tensorflow.keras.models import Sequential
@@ -37,15 +40,15 @@ try:
 except ModuleNotFoundError:
     _TF_AVAILABLE = False
 
-# ───────────────────────── Streamlit page config ───────────────────────────────
+# ───────── Page config ─────────
 st.set_page_config(page_title="Groundwater Forecasts", layout="wide")
 st.title("Groundwater Forecasting — Classic, ML & Deep Learning")
 
 DATA_PATH   = "GW data (missing filled).csv"
-HORIZON_M   = 60              # 5-year (months)
+HORIZON_M   = 60             # 5-year horizon (months)
 SUMMARY_CSV = "yearly_summaries.csv"
 
-# ────────────────────────────── Helpers ────────────────────────────────────────
+# ───────── Helper functions ─────────
 @st.cache_data(show_spinner=False)
 def load_raw(path: str):
     if not Path(path).exists():
@@ -62,11 +65,11 @@ def clean_series(df: pd.DataFrame, well: str) -> pd.Series:
     s = s.where(s.between(q1 - 3*iqr, q3 + 3*iqr)).interpolate(limit_direction="both")
     return pd.Series(s.values, index=df["Date"])
 
-# ────────────────────────────── SARIMA ─────────────────────────────────────────
-def sarima_forecast(series, horizon, seasonal=True):
-    order, s_order = (1,1,1), (1,1,1,12) if seasonal else (0,0,0,0)
-    split          = int(len(series)*0.8)
-    train, test    = series.iloc[:split], series.iloc[split:]
+# ───────── SARIMA ─────────
+def sarima_forecast(series, horizon):
+    order, s_order = (1,1,1), (1,1,1,12)
+    split = int(len(series)*0.8)
+    train, test = series.iloc[:split], series.iloc[split:]
 
     mdl  = SARIMAX(train, order=order, seasonal_order=s_order,
                    enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
@@ -76,30 +79,27 @@ def sarima_forecast(series, horizon, seasonal=True):
                    enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
     idx  = pd.date_range(series.index[-1]+pd.DateOffset(months=1), periods=horizon, freq="MS")
     fc   = pd.Series(full.forecast(horizon).round(2), index=idx)
-    return {"AIC": round(full.aic,1), "BIC": round(full.bic,1), "RMSE test": rmse}, fc
+    return {"RMSE test": rmse, "AIC": round(full.aic,1), "BIC": round(full.bic,1)}, fc
 
-# ───────────────────────── Random-Forest (lags) ────────────────────────────────
-def rf_forecast(series, horizon, n_lags=12, n_estimators=300, random_state=42):
-    # build lag-feature matrix
+# ───────── Random-Forest (lag features) ─────────
+def rf_forecast(series, horizon, n_lags=12):
     df_lag = pd.concat({f"lag{k}": series.shift(k) for k in range(1, n_lags+1)}, axis=1).dropna()
-    X, y   = df_lag.values, series.loc[df_lag.index].values
-    split  = int(len(X)*0.8)
-    rf     = RandomForestRegressor(n_estimators=n_estimators,
-                                   random_state=random_state).fit(X[:split], y[:split])
-    rmse   = round(np.sqrt(mean_squared_error(y[split:], rf.predict(X[split:]))), 4)
+    X, y = df_lag.values, series.loc[df_lag.index].values
+    split = int(len(X)*0.8)
+    rf = RandomForestRegressor(n_estimators=300, random_state=42).fit(X[:split], y[:split])
+    rmse = round(np.sqrt(mean_squared_error(y[split:], rf.predict(X[split:]))), 4)
 
-    # iterative multi-step forecast
-    history = list(series.values[-n_lags:]); fc_vals=[]
+    history = list(series.values[-n_lags:])
+    fc_vals = []
     for _ in range(horizon):
-        x_pred = np.array(history[-n_lags:][::-1]).reshape(1, -1)  # lag1 = most recent
-        next_y = rf.predict(x_pred)[0]
-        fc_vals.append(round(next_y, 2))
-        history.append(next_y)
+        x = np.array(history[-n_lags:][::-1]).reshape(1, -1)
+        y_hat = rf.predict(x)[0]
+        fc_vals.append(round(y_hat,2)); history.append(y_hat)
 
     idx = pd.date_range(series.index[-1]+pd.DateOffset(months=1), periods=horizon, freq="MS")
-    return {"RMSE test": rmse, "Lags": n_lags, "Trees": n_estimators}, pd.Series(fc_vals, index=idx)
+    return {"RMSE test": rmse, "Lags": n_lags, "Trees": 300}, pd.Series(fc_vals, index=idx)
 
-# ────────────────────── Deep-learning helpers (TF available) ───────────────────
+# ───────── Deep-learning helpers (only if TF) ─────────
 if _TF_AVAILABLE:
     def build_lstm(input_shape, units=64):
         net = Sequential([LSTM(units, activation="tanh", input_shape=input_shape),
@@ -141,17 +141,16 @@ if _TF_AVAILABLE:
         rmse = round(np.sqrt(mean_squared_error(
             yte, net.predict(Xte, verbose=0).flatten())), 4)
 
-        history = list(scaled[-n_lags:]); fc_vals=[]
+        history = list(scaled[-n_lags:]); fc=[]
         for _ in range(horizon):
-            x_in = np.array(history[-n_lags:]).reshape((1,n_lags,1))
-            yhat = net.predict(x_in, verbose=0)[0][0]
-            fc_vals.append(yhat); history.append(yhat)
+            yhat = net.predict(np.array(history[-n_lags:]).reshape(1,n_lags,1), verbose=0)[0][0]
+            fc.append(yhat); history.append(yhat)
 
-        fc_vals = scaler.inverse_transform(np.array(fc_vals).reshape(-1,1)).flatten().round(2)
+        fc_vals = scaler.inverse_transform(np.array(fc).reshape(-1,1)).flatten().round(2)
         idx = pd.date_range(series.index[-1]+pd.DateOffset(months=1), periods=horizon, freq="MS")
         return {"RMSE test": rmse, "Lags": n_lags, "Epochs": epochs}, pd.Series(fc_vals, index=idx)
 
-# ──────────────────────────────── UI ───────────────────────────────────────────
+# ──────────── UI setup ────────────
 raw = load_raw(DATA_PATH)
 if raw is None:
     st.error("CSV not found. Upload below.")
@@ -160,7 +159,11 @@ if raw is None:
     st.stop()
 
 wells = [c for c in raw.columns if c.startswith("W")]
-well  = st.sidebar.selectbox("Well", wells)
+
+run_scope = st.sidebar.radio("Scope", ["Single well", "All wells"])
+
+if run_scope == "Single well":
+    well = st.sidebar.selectbox("Well", wells)
 
 model_labels = [
     "SARIMA / SARIMAX (classic)",
@@ -168,13 +171,9 @@ model_labels = [
     "LSTM (deep learning)"   + ("" if _TF_AVAILABLE else "  —  ❌ TF not installed"),
     "CNN-LSTM (hybrid deep)" + ("" if _TF_AVAILABLE else "  —  ❌ TF not installed"),
 ]
-model_choice = st.sidebar.radio("Choose model", model_labels)
+model_choice = st.sidebar.radio("Model", model_labels)
 
-series = clean_series(raw, well)
-if len(series) < 36:
-    st.warning("Need ≥36 monthly points."); st.stop()
-
-# additional sliders
+# extra sliders
 if model_choice.startswith("Random"):
     n_lags = st.sidebar.slider("RF: number of lags", 6, 24, 12, step=2)
 elif model_choice.startswith(("LSTM", "CNN")):
@@ -184,52 +183,70 @@ elif model_choice.startswith(("LSTM", "CNN")):
     n_lags = st.sidebar.slider("DL: number of lags", 6, 24, 12, step=2)
     epochs = st.sidebar.slider("Epochs", 10, 100, 30, step=10)
 
-# ───────────────────────────── Forecast ────────────────────────────────────────
-with st.spinner("Training / forecasting…"):
+# ──────────── Forecast helper ────────────
+def run_forecast(well_id: str):
+    s = clean_series(raw, well_id)
     if model_choice.startswith("SARIMA"):
-        metrics, future = sarima_forecast(series, HORIZON_M)
+        return sarima_forecast(s, HORIZON_M)
+    if model_choice.startswith("Random"):
+        return rf_forecast(s, HORIZON_M, n_lags)
+    if model_choice.startswith("LSTM"):
+        return deep_forecast(s, HORIZON_M, n_lags, epochs, "lstm")
+    return deep_forecast(s, HORIZON_M, n_lags, epochs, "cnn")   # CNN-LSTM
 
-    elif model_choice.startswith("Random"):
-        metrics, future = rf_forecast(series, HORIZON_M, n_lags)
+# ──────────── Run forecasts ────────────
+with st.spinner("Training / forecasting…"):
+    targets = wells if run_scope == "All wells" else [well]
+    summary_rows, detail_future, detail_metrics = [], None, None
 
-    elif model_choice.startswith("LSTM"):
-        metrics, future = deep_forecast(series, HORIZON_M, n_lags, epochs, "lstm")
+    for w in targets:
+        metrics, future = run_forecast(w)
+        yearly = future.resample("A").mean()
+        row = {
+            "Well ID": w,
+            "2025": yearly.get("2025", np.nan),
+            "2026": yearly.get("2026", np.nan),
+            "2027": yearly.get("2027", np.nan),
+            "2028": yearly.get("2028", np.nan),
+            "2029": yearly.get("2029", np.nan),
+        }
+        row.update(metrics); summary_rows.append(row)
 
-    else:  # CNN-LSTM
-        metrics, future = deep_forecast(series, HORIZON_M, n_lags, epochs, "cnn")
+        if run_scope == "Single well":   # keep for detailed table
+            detail_future, detail_metrics = future, metrics
 
-# ─────────────────────────── Display results ──────────────────────────────────
-st.subheader("Model metrics")
-st.table(pd.DataFrame(metrics, index=["Value"]))
+summary_df = pd.DataFrame(summary_rows)
 
-st.subheader("5-year monthly forecast")
-st.dataframe(future.to_frame("Depth"), use_container_width=True)
+# ──────────── Display ────────────
+st.subheader("Yearly forecast summary (average depth)")
+st.dataframe(summary_df, use_container_width=True)
 
-# ───────────────────────── Save yearly summary ────────────────────────────────
-if st.button("💾 Save yearly summary"):
-    row = {"Well": well}
-    yearly = future.resample("A").mean()
-    for yr in range(2025, 2030):
-        v = yearly.get(str(yr)); row[str(yr)] = v.values[0] if v is not None else np.nan
-    row.update(metrics)
+if run_scope == "Single well":
+    st.subheader("Model metrics (selected well)")
+    st.table(pd.DataFrame(detail_metrics, index=["Value"]))
+    st.subheader("5-year monthly forecast")
+    st.dataframe(detail_future.to_frame("Depth"), use_container_width=True)
 
-    df_row = pd.DataFrame([row])
-    if os.path.exists(SUMMARY_CSV):
-        pd.concat([pd.read_csv(SUMMARY_CSV), df_row],
-                  ignore_index=True).to_csv(SUMMARY_CSV, index=False)
-    else:
-        df_row.to_csv(SUMMARY_CSV, index=False)
+# ──────────── Save yearly summary (only single well) ────────────
+if run_scope == "Single well":
+    if st.button("💾 Save yearly summary"):
+        df_row = summary_df  # single row
+        if os.path.exists(SUMMARY_CSV):
+            pd.concat([pd.read_csv(SUMMARY_CSV), df_row],
+                      ignore_index=True).to_csv(SUMMARY_CSV, index=False)
+        else:
+            df_row.to_csv(SUMMARY_CSV, index=False)
 
-    st.session_state.setdefault("summary_rows", []).append(df_row)
-    st.success(f"Saved to '{SUMMARY_CSV}' – total rows: {len(st.session_state['summary_rows'])}")
+        st.session_state.setdefault("summary_rows", []).append(df_row)
+        st.success(f"Saved to '{SUMMARY_CSV}' – total rows: {len(st.session_state['summary_rows'])}")
 
-# ───────────────────────────── Download area ──────────────────────────────────
+# ──────────── Download area ────────────
 n_rows = len(st.session_state.get("summary_rows", []))
 st.sidebar.markdown(f"**Saved summaries in session:** {n_rows}")
 if n_rows:
-    combined = pd.concat(st.session_state["summary_rows"]).reset_index(drop=True)
+    combo = pd.concat(st.session_state["summary_rows"]).reset_index(drop=True)
     st.sidebar.download_button("⬇️ Download CSV from session",
-                               combined.to_csv(index=False).encode(),
+                               combo.to_csv(index=False).encode(),
                                f"well_summaries_{datetime.today().date()}.csv",
                                "text/csv")
 if os.path.exists(SUMMARY_CSV):

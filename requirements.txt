@@ -1,7 +1,7 @@
-streamlit
-pandas
-numpy
-plotly
-scikit-learn
-statsmodels
-tensorflow-cpu
+streamlit==1.45.1      # pin major.minor
+pandas==2.3.0
+plotly==6.1.2
+scikit-learn==1.4.2
+statsmodels==0.14.4
+numpy==1.26.4
+tensorflow-cpu==2.15.0

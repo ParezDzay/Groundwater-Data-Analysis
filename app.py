@@ -204,11 +204,11 @@ with st.spinner("Training / forecasting…"):
         yearly = future.resample("A").mean()
         row = {
             "Well ID": w,
-            "2025": yearly.get("2025", np.nan),
-            "2026": yearly.get("2026", np.nan),
-            "2027": yearly.get("2027", np.nan),
-            "2028": yearly.get("2028", np.nan),
-            "2029": yearly.get("2029", np.nan),
+            "2025": yearly.get("2025"),
+            "2026": yearly.get("2026"),
+            "2027": yearly.get("2027"),
+            "2028": yearly.get("2028"),
+            "2029": yearly.get("2029"),
         }
         row.update(metrics); summary_rows.append(row)
 
